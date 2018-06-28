@@ -36,7 +36,7 @@ def get_joint_angles(pose, seed_cmd = None, use_advanced_options = False):
     if use_advanced_options:
         # Optional Advanced IK parameters
         # The joint seed is where the IK position solver starts its optimization
-        ikreq.seed_mode = ikreq.SEED_USER
+        ikreq.seed_mode = ikreq.SEED_AUTO
 
         # if not seed_joints:
         #     seed = JointState()

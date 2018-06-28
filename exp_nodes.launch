@@ -4,4 +4,6 @@
     <node pkg="sawyer_control" type="observations_server.py" name="observation" />
     <node pkg="sawyer_control" type="jacobian_server.py" name="jacobians" />
     <node pkg="sawyer_control" type="ik_server.py" name="inverse_kinematics" />
+    <node pkg="sawyer_control" type="angle_action_server.py" name="angle_action" />
+    <node pkg="sawyer_control" type="image_server.py" name="images" />
 </launch>

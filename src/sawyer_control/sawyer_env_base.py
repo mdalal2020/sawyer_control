@@ -1,5 +1,6 @@
 import numpy as np
 import rospy
+import time
 from sawyer_control.joint_angle_pd_controller import AnglePDController
 from sawyer_control.eval_util import create_stats_ordered_dict
 from sawyer_control.serializable import Serializable
@@ -8,30 +9,42 @@ from rllab.spaces.box import Box
 from sawyer_control.srv import observation
 from sawyer_control.msg import actions
 from sawyer_control.srv import getRobotPoseAndJacobian
+from sawyer_control.srv import ik
+from sawyer_control.srv import angle_action
+from sawyer_control.srv import image
 from rllab.envs.base import Env
+import cv2
 class SawyerEnv(Env, Serializable):
     def __init__(
             self,
-            update_hz=20,
+            update_hz=20, #look into the freq update
             action_mode='torque',
+            relative_pos_control=True,
             safety_box=True,
-            reward='MSE',
+            reward='norm',
             huber_delta=10,
-            safety_force_magnitude=8,
-            safety_force_temp=15,
-            safe_reset_length=150,
+            safety_force_magnitude=5,
+            safety_force_temp=5,
+            safe_reset_length=200,
             reward_magnitude=1,
+            ee_pd_time_steps=25,
+            ee_pd_scale = 25,
+            ee_pd_damping_scale=20,
+            ee_pd_action_limit=1,
+            img_observation = False
     ):
         Serializable.quick_init(self, locals())
         self.init_rospy(update_hz)
-        
-        self.safety_box_lows = np.array([-0.03900771, -0.32655392, -1])
-        self.safety_box_highs = np.array([0.79529649, 0.3227083, 1])
-
+        #default, do not change
+        self.reset_safety_box_lows = np.array([-.2, -0.6, 0])
+        self.reset_safety_box_highs = np.array([.9, 0.4, 2])
+        self.set_safety_box()
         self.joint_names = ['right_j0', 'right_j1', 'right_j2', 'right_j3', 'right_j4', 'right_j5', 'right_j6']
-        self.link_names = ['right_l2', 'right_l3', 'right_l4', 'right_l5', 'right_l6', '_hand']
+        # self.link_names = ['right_l2', 'right_l3', 'right_l4', 'right_l5', 'right_l6', '_hand']
+        self.link_names = ['right_l2', 'right_l3', 'right_l4', 'right_l5', 'right_l6']
 
         self.action_mode = action_mode
+        self.relative_pos_control = relative_pos_control
         self.reward_magnitude = reward_magnitude
         self.safety_box = safety_box
         self.safe_reset_length = safe_reset_length
@@ -40,15 +53,14 @@ class SawyerEnv(Env, Serializable):
         self.safety_force_temp = safety_force_temp
         self.AnglePDController = AnglePDController()
 
-        max_torques = 0.5 * np.array([8, 7, 6, 5, 4, 3, 2])
+        max_torques = 1/2 * np.array([8, 7, 6, 5, 4, 3, 2])
         self.joint_torque_high = max_torques
         self.joint_torque_low = -1 * max_torques
-
-        self._action_space = Box(
-            self.joint_torque_low,
-            self.joint_torque_high
-        )
-
+        self.ee_pd_time_steps = ee_pd_time_steps
+        self.ee_pd_scale = ee_pd_scale
+        self.ee_pd_damping_scale = ee_pd_damping_scale
+        self.ee_pd_action_limit = 1
+        self.img_observation = img_observation
         if reward == 'MSE':
             self.reward_function = self._MSE_reward
         elif reward == 'huber':
@@ -58,45 +70,84 @@ class SawyerEnv(Env, Serializable):
 
         self._set_action_space()
         self._set_observation_space()
-        self.get_latest_pose_jacobian_dict()
+        # self.get_latest_pose_jacobian_dict()
         self.in_reset = True
-        self.amplify = np.ones(7)*2.5
-        self.pd_time_steps = 50
-        self.jacobian_pseudo_inverse_torques_scale = 10
-        self.damping_scale = 5
+        self.amplify = np.ones(7)*self.joint_torque_high
+        self.thresh = True
+        self.prev_time = time.time()
+
+    def set_safety_box(self,
+                       pos_low = np.array([0.53, -.32, 0.35]),
+                       pos_high = np.array([0.75, 0.32, 0.5]),
+                       torq_low = np.array([0.2, -0.2, .03]),
+                       torq_high = np.array([0.6, 0.2, 0.5]),
+                       ee_low = np.zeros(3),
+                       ee_high=np.zeros(3),
+                    ):
+        self.pd_safety_box_high = pos_high
+        self.pd_safety_box_low = pos_low
+        self.safety_box_lows = self.not_reset_safety_box_lows = torq_low
+        self.safety_box_highs = self.not_reset_safety_box_highs = torq_high
+        self.ee_safety_box_low = ee_low
+        self.ee_safety_box_high = ee_high
+
+
 
     def _act(self, action):
         if self.action_mode == 'position':
-            self._jac_act_damp(action)
+            action_scaled = action.copy()/25.0
+            self._joint_act(action_scaled)
         else:
-            return self._torque_act(action)
+            self._torque_act(action)
+        return
+
+    def _joint_act(self, action):
+        ee_pos = self._end_effector_pose()
+        if self.relative_pos_control:
+            target_ee_pos = (ee_pos[:3] + action)
+        else:
+            target_ee_pos = action
+        target_ee_pos = np.clip(target_ee_pos, self.ee_safety_box_low, self.ee_safety_box_high)
+        target_ee_pos = np.concatenate((target_ee_pos, ee_pos[3:]))
+        angles = self.request_ik_angles(target_ee_pos, self._joint_angles())
+        self.send_angle_action(angles)
 
     def _jac_act_damp(self, action):
         ee_pos = self._end_effector_pose()[:3]
+        action = np.clip(action, -1*self.ee_pd_action_limit, self.ee_pd_action_limit)
+        action /= 10.0
         target_ee_pos = (ee_pos + action)
-        prev_jacobian_pseudo_inverse = 0
-        for i in range(self.pd_time_steps):
+        prev_torques = 0
+        for i in range(self.ee_pd_time_steps):
             ee_pos = self._end_effector_pose()[:3]
-            difference = (ee_pos - target_ee_pos)
-            jacobian_pseudo_inverse = self._jacobian_pseudo_inverse_torques(difference)
-            torque_action = -1*(jacobian_pseudo_inverse + self.damping_scale*(jacobian_pseudo_inverse  - prev_jacobian_pseudo_inverse)/self.jacobian_pseudo_inverse_torques_scale)
-            prev_jacobian_pseudo_inverse = jacobian_pseudo_inverse
-            self._torque_act(torque_action)
+            difference = (target_ee_pos - ee_pos) * -1
+            torques = self._jacobian_pseudo_inverse_torques(difference)
+            torques = -1*(torques * self.ee_pd_scale + self.ee_pd_damping_scale * (torques - prev_torques))
+            prev_torques = torques
+            self._torque_act(torques)
             if self._endpoint_within_threshold(ee_pos, target_ee_pos):
                 break
 
-    def _jacobian_pseudo_inverse_torques(self, difference_ee_pos):
-        self.get_latest_pose_jacobian_dict()
-        ee_jac = self.pose_jacobian_dict['right_l6'][1]
-        return ee_jac.T @ np.linalg.inv(ee_jac @ ee_jac.T) @ difference_ee_pos * self.jacobian_pseudo_inverse_torques_scale
+    # def _jacobian_pseudo_inverse_torques(self, difference_ee_pos):
+    #     self.get_latest_pose_jacobian_dict()
+    #     ee_jac = self.pose_jacobian_dict['right_l6'][1]
+    #     return ee_jac.T @ np.linalg.inv(ee_jac @ ee_jac.T) @ difference_ee_pos * self.ee_pd_scale
 
     def _endpoint_within_threshold(self, ee_pos, target_ee_pos):
-        maximum = np.max(np.abs(ee_pos-target_ee_pos))
-        cond = maximum < .01
+        maximum = np.max(np.abs(ee_pos-target_ee_pos)[:2])
+        cond = maximum < .02
+        z_cond = np.abs(ee_pos-target_ee_pos)[2] <.02
+        cond = cond and z_cond
         return cond
 
     def _torque_act(self, action):
         if self.safety_box:
+            if self.in_reset:
+                self.safety_box_highs = self.reset_safety_box_highs
+                self.safety_box_lows = self.reset_safety_box_lows
+            else:
+                self.safety_box_lows = self.not_reset_safety_box_lows
+                self.safety_box_highs = self.not_reset_safety_box_highs
             self.get_latest_pose_jacobian_dict()
             truncated_dict = self.check_joints_in_box()
             if len(truncated_dict) > 0:
@@ -107,15 +158,18 @@ class SawyerEnv(Env, Serializable):
                     force = forces_dict[joint]
                     torques = torques + np.dot(jacobian.T, force).T
                 torques[-1] = 0
-                action = action + torques
-
+                action = torques
         if self.in_reset:
-            np.clip(action, -4, 4, out=action)
+            np.clip(action, -5, 5, out=action)
         else:
             action = self.amplify * action
             action = np.clip(np.asarray(action), self.joint_torque_low, self.joint_torque_high)
         self.send_action(action)
         self.rate.sleep()
+        curr_time = time.time()
+        diff = curr_time - self.prev_time
+        self.prev_time = curr_time
+        # print(diff)
 
     def _reset_angles_within_threshold(self):
         desired_neutral = self.AnglePDController._des_angles
@@ -151,7 +205,7 @@ class SawyerEnv(Env, Serializable):
         return reward
 
     def _Norm_reward(self, differences):
-        return np.linalg.norm(differences)
+        return -1*np.linalg.norm(differences)
 
     def compute_angle_difference(self, angles1, angles2):
         self._wrap_angles(angles1)
@@ -166,6 +220,8 @@ class SawyerEnv(Env, Serializable):
         reward = self.reward() * self.reward_magnitude
         done = False
         info = {}
+        if self.img_observation:
+            observation = self.get_image()
         return observation, reward, done, info
 
     def reward(self):
@@ -185,6 +241,28 @@ class SawyerEnv(Env, Serializable):
             endpoint_pose,
             self.desired
         ))
+        return temp
+
+
+    def get_image(self):
+        temp = self.request_image()
+        #update the get image in server. get an 84 x 84 x 3
+        #reshape to 84 x 84 x 3
+        temp = np.array(temp)
+        temp = temp.reshape(84, 84, 3)
+        img = temp[:40, 12:63]
+        img = cv2.resize(img, (0, 0), fx=1.64705882, fy=2.1)
+        observation = img / 255.0
+        observation = observation.transpose()
+        observation = observation.flatten()
+        return observation
+
+    def get_image_data(self):
+        temp = self.request_image()
+        # update the get image in server. get an 84 x 84 x 3
+        # reshape to 84 x 84 x 3
+        temp = np.array(temp)
+        temp = temp.reshape(84, 84, 3)
         return temp
 
     def _safe_move_to_neutral(self):
@@ -250,16 +328,25 @@ class SawyerEnv(Env, Serializable):
         joint_dict = self.pose_jacobian_dict.copy()
         keys_to_remove = []
         for joint in joint_dict.keys():
-            if self._pose_in_box(joint_dict[joint][0]):
+            if (joint == 'right_l6' or joint=='_hand') and not self.in_reset:
+                lows = self.ee_safety_box_low
+                highs = self.ee_safety_box_high
+            else:
+                lows = self.safety_box_lows
+                highs = self.safety_box_highs
+            if self._pose_in_box(joint_dict[joint][0], lows, highs):
                 keys_to_remove.append(joint)
+            else:
+                print('violated', joint_dict[joint][0])
         for key in keys_to_remove:
             del joint_dict[key]
+        print(joint_dict.keys())
         return joint_dict
-
-    def _pose_in_box(self, pose):
+    
+    def _pose_in_box(self, pose,lows, highs):
         within_box = [curr_pose > lower_pose and curr_pose < higher_pose
                       for curr_pose, lower_pose, higher_pose
-                      in zip(pose, self.safety_box_lows, self.safety_box_highs)]
+                      in zip(pose, lows, highs)]
         return all(within_box)
 
     def _get_adjustment_forces_per_joint_dict(self, joint_dict):
@@ -275,6 +362,7 @@ class SawyerEnv(Env, Serializable):
         curr_x = pose[0]
         curr_y = pose[1]
         curr_z = pose[2]
+
         if curr_x > self.safety_box_highs[0]:
             x = -1 * np.exp(np.abs(curr_x - self.safety_box_highs[0]) * self.safety_force_temp) * self.safety_force_magnitude
         elif curr_x < self.safety_box_lows[0]:
@@ -353,6 +441,9 @@ class SawyerEnv(Env, Serializable):
     def send_action(self, action):
         self.action_publisher.publish(action)
 
+    def send_angle_action(self, action):
+        self.request_angle_action(action)
+
     def request_observation(self):
         rospy.wait_for_service('observations')
         try:
@@ -367,6 +458,40 @@ class SawyerEnv(Env, Serializable):
         except rospy.ServiceException as e:
             print(e)
 
+    def request_angle_action(self, angles):
+        rospy.wait_for_service('angle_action')
+        try:
+            execute_action = rospy.ServiceProxy('angle_action', angle_action, persistent=True)
+            resp = execute_action(angles, self.thresh)
+            return (
+                    None
+            )
+        except rospy.ServiceException as e:
+            print(e)
+
+
+    def request_ik_angles(self, ee_pos, joint_angles):
+        rospy.wait_for_service('ik')
+        try:
+            get_joint_angles = rospy.ServiceProxy('ik', ik, persistent=True)
+            resp = get_joint_angles(ee_pos, joint_angles)
+
+            return (
+                resp.joint_angles
+            )
+        except rospy.ServiceException as e:
+            print(e)
+
+    def request_image(self):
+        rospy.wait_for_service('images')
+        try:
+            request = rospy.ServiceProxy('images', image, persistent=True)
+            obs = request()
+            return (
+                    obs.image
+            )
+        except rospy.ServiceException as e:
+            print(e)
     @property
     def horizon(self):
         raise NotImplementedError
@@ -383,9 +508,8 @@ class SawyerEnv(Env, Serializable):
         self.joint_torque_low = -1 * max_torques
 
         if self.action_mode == 'position':
-            delta_factor = 0.1
-            delta_high = delta_factor * np.ones(3)
-            delta_low = delta_factor * -1 * np.ones(3)
+            delta_high = self.ee_pd_action_limit * np.ones(3)
+            delta_low = self.ee_pd_action_limit * -1 * np.ones(3)
 
             self._action_space = Box(
                 delta_low,
